@@ -614,6 +614,52 @@ def test_midprune_vanished_entry_is_recorded_not_counted(tmp_path: Path) -> None
     assert "re-scan failed" not in log, log
 
 
+class _ProcessExited(BaseException):
+    """The short-lived process exits: the daemon prune thread stops wherever it is."""
+
+
+def _prune_cut_off_mid_rmtree(home: Path) -> tuple[Path, Path]:
+    scratch = get_scratch_dir(home, prune=False)
+    entry = scratch / "big-lane"
+    for d in range(3):
+        (entry / f"d{d}").mkdir(parents=True)
+        for f in range(3):
+            (entry / f"d{d}" / f"f{f}").write_text("old output", encoding="utf-8")
+    ancient = time.time() - 30 * 3600
+    for dirpath, _dirnames, filenames in os.walk(entry, topdown=False):
+        for name in filenames:
+            os.utime(os.path.join(dirpath, name), (ancient, ancient))
+        os.utime(dirpath, (ancient, ancient))
+    real_rmtree = shutil.rmtree
+
+    def exits_midway(path, *args, **kwargs):
+        real_rmtree(os.path.join(path, "d0"))  # these unlinks freshen the remainder's mtimes
+        raise _ProcessExited
+
+    with patch("hermes_constants_scratch.shutil.rmtree", exits_midway), pytest.raises(_ProcessExited):
+        prune_scratch_dir(scratch)
+    assert not (entry / "d0").exists() and (entry / "d1" / "f0").exists()
+    return scratch, entry
+
+
+def test_removal_cut_off_mid_rmtree_is_finished_by_the_next_pass_unless_written_to(tmp_path: Path) -> None:
+    """The prune runs on a daemon thread, so a short `hermes` command can exit inside the
+    rmtree of a large idle entry. The deletions gave the remainder fresh directory mtimes; the
+    next pass must still finish it instead of keeping it another 24 h, but a file written into
+    the remainder after the cut keeps it. Red on 5e1fed0f: the remainder is kept as touched."""
+    scratch, entry = _prune_cut_off_mid_rmtree(tmp_path / "cut")
+    assert prune_scratch_dir(scratch) == 1
+    assert not entry.exists()
+    log = (tmp_path / "cut" / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
+    assert f"removed {str(entry)!r} (" in log, log
+
+    scratch, entry = _prune_cut_off_mid_rmtree(tmp_path / "reused")
+    payload = entry / "d1" / "f0"
+    payload.write_text("FRESH, written after the cut", encoding="utf-8")  # moves no directory mtime
+    assert prune_scratch_dir(scratch) == 0
+    assert payload.read_text(encoding="utf-8-sig") == "FRESH, written after the cut"
+
+
 def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) -> None:
     """R2/P2 on #134173: after rmtree, the removal-confirmation gate uses
     os.path.lexists(), which swallows OSError from lstat and returns False — so an

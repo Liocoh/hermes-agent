@@ -1027,9 +1027,9 @@ def prune_scratch_dir_in_background(scratch: Path) -> None:
     The thread gets the path, never re-resolves it: threads do not inherit the profile-override
     contextvar. A process that exits mid-prune kills the daemon thread with the hourly stamp
     already touched; every deletion is re-validated right before it happens, so a cut pass only
-    leaves fewer entries removed. Entries it never reached go on the next hourly pass; the one
-    cut inside ``rmtree`` has fresh directory mtimes from the unlinks, so its remainder goes
-    24 h later like any other entry written to."""
+    leaves fewer entries removed. Entries it never reached go on the next hourly pass, and so
+    does the remainder of the one cut inside ``rmtree`` (``hermes_constants_scratch_resume``):
+    the unlinks freshened its directory mtimes, so the idle rule alone would keep it 24 h more."""
     global _scratch_prune_thread
     if _scratch_pruned_once:
         return

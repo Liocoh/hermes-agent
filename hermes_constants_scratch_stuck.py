@@ -74,24 +74,24 @@ def _still_stuck(root: Path, name: str, rec: dict, now: float) -> bool:
     )
 
 
-def _read(root: Path) -> dict[str, dict]:
+def read_state(root: Path, name: str = STUCK_STATE_NAME) -> dict[str, dict]:
     # A torn or hand-edited file reads as empty: the worst case is one re-walk and one line.
     try:
-        data = json.loads((root / STUCK_STATE_NAME).read_text(encoding="utf-8-sig"))
+        data = json.loads((root / name).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
         return {}
     return {k: v for k, v in data.items() if isinstance(v, dict)} if isinstance(data, dict) else {}
 
 
-def _write(root: Path, state: dict[str, dict]) -> None:
+def write_state(root: Path, state: dict[str, dict], name: str = STUCK_STATE_NAME) -> None:
     """Publish *state* via a unique temp file + ``os.replace``: a reader sees old or new, never torn."""
-    path = root / STUCK_STATE_NAME
+    path = root / name
     if not state:
         with contextlib.suppress(OSError):
             path.unlink(missing_ok=True)
         return
     try:
-        fd, tmp = tempfile.mkstemp(dir=root, prefix=STUCK_STATE_NAME + ".", suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=root, prefix=name + ".", suffix=".tmp")
     except OSError:
         return
     try:
@@ -104,9 +104,9 @@ def _write(root: Path, state: dict[str, dict]) -> None:
 
 
 @contextlib.contextmanager
-def _locked(root: Path):
-    """Exclusive cross-process lock around a read-merge-write of the state file. Two pruners of
-    one home (separate processes past the ``.last_prune`` throttle together) otherwise overwrite
+def state_lock(root: Path):
+    """Exclusive cross-process lock around a read-merge-write of a scratch-root state file
+    (these records and ``hermes_constants_scratch_resume``'s). Two pruners of one home (separate processes past the ``.last_prune`` throttle together) otherwise overwrite
     each other's records from stale snapshots. POSIX only, like the tracking itself."""
     import fcntl
 
@@ -125,14 +125,14 @@ def load_skips(root: Path, *, persist: bool = True) -> frozenset[str]:
         return frozenset()
     now = time.time()
     if not persist:
-        state = _read(root)
+        state = read_state(root)
         return frozenset(n for n, rec in state.items() if _still_stuck(root, n, rec, now))
     try:
-        with _locked(root):
-            state = _read(root)
+        with state_lock(root):
+            state = read_state(root)
             live = {n: rec for n, rec in state.items() if _still_stuck(root, n, rec, now)}
             if live != state:
-                _write(root, live)
+                write_state(root, live)
     except OSError:
         return frozenset()
     return frozenset(live)
@@ -175,10 +175,10 @@ def record(root: Path, entry: Path, blockers: list[str], audit) -> None:
     if fp is None or not blockers:
         return
     rec = {"fp": fp, "since": time.time(), "uid": os.geteuid(), "blockers": blockers[:_MAX_BLOCKERS]}  # windows-footgun: ok — only reached when tracking_supported()
-    with contextlib.suppress(OSError), _locked(root):
-        state = _read(root)  # re-read under the lock: merge, never publish a stale snapshot
+    with contextlib.suppress(OSError), state_lock(root):
+        state = read_state(root)  # re-read under the lock: merge, never publish a stale snapshot
         state[entry.name] = rec
-        _write(root, state)
+        write_state(root, state)
     audit.info(
         "scratch prune: cannot remove %r: it holds files this user (uid %d) may not read or "
         "delete, usually root-owned output of a Docker container; skipping it until that is "

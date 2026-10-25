@@ -269,7 +269,10 @@ registration that pointed into it. A process Hermes itself started and still tra
 background `terminal` process, the gateway, a CLI session, or anything they launched that is
 still their child) is never stopped: an idle entry one of them is working inside is kept
 instead. Each entry is re-checked right before it is deleted, so
-one written to while the prune was stopping processes is kept. Every removal, stopped
+one written to while the prune was stopping processes is kept. A deletion cut short (a short
+`hermes` command can exit while the background prune is still deleting a large entry) is
+finished by the next pass instead of waiting another 24 hours, unless a file was written into
+what was left of the entry in the meantime. Every removal, stopped
 process and kept entry is recorded in `~/.hermes/logs/scratch-prune.log`. An entry holding
 files your user may not read or delete (typically root-owned output of a Docker container that
 wrote into a bind mount) is never deleted partially-blind: it is logged once with the command that

@@ -21,6 +21,7 @@ import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+import hermes_constants_scratch_resume as resume
 import hermes_constants_scratch_stuck as stuck
 
 logger = logging.getLogger(__name__)
@@ -114,13 +115,16 @@ def subtree_touch_state(path: Path, cutoff: float) -> str:
     return _scan_subtree(path, cutoff)[0]
 
 
-def _scan_subtree(path: Path, cutoff: float) -> tuple[str, str | None]:
+def _scan_subtree(path: Path, cutoff: float, *, dir_mtimes: bool = True) -> tuple[str, str | None]:
     """``(state, denied_dir)``: *denied_dir* is the directory below *path* that refused
-    listing with EACCES/EPERM when that is why the scan failed (else None)."""
+    listing with EACCES/EPERM when that is why the scan failed (else None). Without
+    *dir_mtimes* only non-directories count as writes (a removal cut off mid-``rmtree``
+    freshened every directory it emptied)."""
     try:
-        if os.lstat(path).st_mtime >= cutoff:
+        is_dir = path.is_dir() and not path.is_symlink()
+        if os.lstat(path).st_mtime >= cutoff and (dir_mtimes or not is_dir):
             return _TOUCHED, None
-        if not path.is_dir() or path.is_symlink():
+        if not is_dir:
             return _IDLE, None
     except OSError:
         return _SCAN_FAILED, None
@@ -134,9 +138,11 @@ def _scan_subtree(path: Path, cutoff: float) -> tuple[str, str | None]:
                         st = child.stat(follow_symlinks=False)
                     except OSError as exc:
                         return _SCAN_FAILED, current if stuck.is_permission_error(exc) else None
-                    if st.st_mtime >= cutoff and not (st.st_nlink > 1 and child.is_file(follow_symlinks=False)):
+                    child_is_dir = child.is_dir(follow_symlinks=False)
+                    if st.st_mtime >= cutoff and (dir_mtimes or not child_is_dir) \
+                            and not (st.st_nlink > 1 and child.is_file(follow_symlinks=False)):
                         return _TOUCHED, None
-                    if child.is_dir(follow_symlinks=False):
+                    if child_is_dir:
                         stack.append(child.path)
         except OSError as exc:
             return _SCAN_FAILED, current if stuck.is_permission_error(exc) else None
@@ -350,6 +356,48 @@ def release_git_worktrees(repos: set[str]) -> None:
             logger.debug("git worktree prune in %s failed: %s", repo, exc)
 
 
+def _remove(root: Path, entry: Path, size: int, audit: logging.Logger, *, resumed: bool) -> bool:
+    """Delete one re-validated entry; True only when it is confirmed gone."""
+    tree = entry.is_dir() and not entry.is_symlink()
+    denied: list[str] = []
+    failure: OSError | None = None
+    if tree:
+        # Held for exactly the rmtree: only a pass that dies inside it leaves the record behind.
+        resume.begin(root, entry)
+    try:
+        if tree:
+            denied = stuck.rmtree_collecting_permission_errors(entry)
+        else:
+            entry.unlink()
+    except OSError as exc:
+        failure = exc
+    if tree:
+        resume.end(root, entry)
+    if failure is not None:
+        audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), failure)
+        return False
+    # rmtree ignores errors, so only a path that is really gone counts as removed.
+    # Only an explicit lstat proves absence: lexists() swallows OSError from lstat,
+    # so an entry that stayed (rmtree left residue) but cannot be inspected would be
+    # counted and recorded as removed — the same invented reason the vanish rule
+    # refuses to invent (P2 on #134173).
+    try:
+        os.lstat(entry)
+        if denied and stuck.tracking_supported():
+            stuck.record(root, entry, denied, audit)
+        else:
+            audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
+        return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        audit.info("scratch prune: could not confirm removal of %r", os.fspath(entry))
+        return False
+    audit.info("scratch prune: removed %r (%d bytes%s)", os.fspath(entry), size,
+               ", finishing a removal an earlier pass was cut off in" if resumed else "")
+    return True
+
+
 def prune_idle_entries(
     root: Path, max_idle_hours: float, skip_names: frozenset[str], log_file: Path | None = None,
 ) -> int:
@@ -373,13 +421,20 @@ def _prune_idle_entries(
     cutoff = time.time() - max_idle_hours * 3600
     # Entries already known to hold files this user cannot read or delete are skipped before
     # any walk, until that is fixed (hermes_constants_scratch_stuck).
-    skip_names = skip_names | stuck.load_skips(root) | {stuck.STUCK_STATE_NAME, stuck.STUCK_LOCK_NAME}
+    skip_names = skip_names | stuck.load_skips(root) | {stuck.STUCK_STATE_NAME, stuck.STUCK_LOCK_NAME, resume.STATE_NAME}
     try:
         entries = [e for e in root.iterdir() if e.name not in skip_names]
     except OSError:
         return 0
+    # Removals an earlier pass was cut off in (its process exited mid-rmtree): the directories
+    # it emptied carry the deletion's own fresh mtimes, so the idle rule would keep the
+    # remainder for another full period (hermes_constants_scratch_resume).
+    unfinished = resume.pending(root)
     doomed = []
     for e in entries:
+        if e.name in unfinished:
+            doomed.append(e)
+            continue
         state, denied_dir = _scan_subtree(e, cutoff)
         if state == _IDLE:
             doomed.append(e)
@@ -416,8 +471,12 @@ def _prune_idle_entries(
         # the re-check and rmtree reopens the window for a write landing during that
         # walk to be destroyed (review F6 on #139850).
         size = _tree_bytes(entry)
-        state = subtree_touch_state(entry, cutoff)
+        since = unfinished.get(entry.name)
+        # An unfinished removal is re-checked for files written since it started; any one rescues it.
+        state = subtree_touch_state(entry, cutoff) if since is None else _scan_subtree(entry, since, dir_mtimes=False)[0]
         if state != _IDLE:
+            if since is not None:
+                resume.end(root, entry)
             # Only a missing path is a vanish: a stat that raises PermissionError means
             # the entry is there but unreadable, and reporting it as vanished would be
             # the same invented reason the audit exists to prevent.
@@ -441,33 +500,7 @@ def _prune_idle_entries(
                     os.fspath(entry),
                 )
             continue
-        denied: list[str] = []
-        try:
-            if entry.is_dir() and not entry.is_symlink():
-                denied = stuck.rmtree_collecting_permission_errors(entry)
-            else:
-                entry.unlink()
-        except OSError as exc:
-            audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
-            continue
-        # rmtree ignores errors, so only a path that is really gone counts as removed.
-        # Only an explicit lstat proves absence: lexists() swallows OSError from lstat,
-        # so an entry that stayed (rmtree left residue) but cannot be inspected would be
-        # counted and recorded as removed — the same invented reason the vanish rule
-        # above refuses to invent (P2 on #134173).
-        try:
-            os.lstat(entry)
-            if denied and stuck.tracking_supported():
-                stuck.record(root, entry, denied, audit)
-            else:
-                audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
-            continue
-        except FileNotFoundError:
-            pass
-        except OSError:
-            audit.info("scratch prune: could not confirm removal of %r", os.fspath(entry))
-            continue
-        audit.info("scratch prune: removed %r (%d bytes)", os.fspath(entry), size)
-        removed += 1
+        if _remove(root, entry, size, audit, resumed=since is not None):
+            removed += 1
     release_git_worktrees(repos)
     return removed
